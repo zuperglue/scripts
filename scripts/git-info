@@ -5,6 +5,55 @@ HELP_PREFIX='# CMD:'
 HELP_CMD_PREFIX='# ARG-'
 
 
+# CMD: branch - current branch
+function git_branch {
+    git rev-parse --abbrev-ref HEAD
+}
+
+# CMD: commit - current commit (short version)
+function git_commit {
+    git show -s --format='%h'
+}
+
+# CMD: tag - current tag (if any)
+function git_tag {
+    set +e
+    git describe --exact-match "${GIT_COMMIT}" 2>/dev/null | sed -n 's/^\([^^~]\{1,\}\)\(\^0\)\{0,1\}$/\1/p'
+    set -e
+}
+
+# CMD: status - current status (or nothing if nothing modified)
+function git_status {
+    git status -s
+}
+
+# CMD: version - proposed version/tag using git info
+function version {
+    STATUS_=$(git_status)
+    BRANCH_=$(git_branch)
+    COMMIT_=$(git_commit)
+    TAG_=$(git_tag)
+
+    # If not master show branch
+    if [ "$BRANCH_" == "master" ]; then
+        BRANCH_=""
+    else
+        BRANCH_="$BRANCH_-"
+    fi
+
+    # If no tag -> commit
+    if [[ -z $TAG_ ]]; then
+        TAG_="$COMMIT_"
+    fi
+
+    # Staged/modified files -> SHOPSHOT
+    if [[ ! -z $STATUS_ ]]; then
+        STATUS_="-SNAPSHOT"
+    fi
+
+    echo "$BRANCH_$TAG_$STATUS_"
+}
+
 
 # CMD: help [COMMAND] - lists availible commands
 # ARG-help: [COMMAND] - list helps for a command
@@ -18,33 +67,25 @@ function help {
     fi
 }
 
-# CMD: build NAME [OPTION] - builds artifacts
-# ARG-build: NAME - artifact name
-# ARG-build: [COMMAND] - build option
-
-
-# assert_file <FAIL_MSG> <FILENAME>
-function assert_file {
-    if [ ! -f ${2} ]; then
-         echo "$1" >&2
-         exit 1
-    fi
-}
-
-# assert_arg <FAIL_MSG> <ARG>
-function assert_arg {
-    if [ -z ${2+x} ]; then
-        echo "$1" >&2
-        exit 1
-    fi
-}
-
 case "$1" in
     help)
         help $2
         ;;
-
-
+    branch)
+        git_branch
+        ;;
+    commit)
+        git_commit
+        ;;
+    tag)
+        git_tag
+        ;;
+    status)
+        git_status
+        ;;
+    version)
+        version
+        ;;
     *)
         echo "Invalid command: $1"
         echo $"Usage: $0 {push|pull|deploy|repositories|clusters|services}"
