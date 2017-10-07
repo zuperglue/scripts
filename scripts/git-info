@@ -1,0 +1,53 @@
+#!/bin/bash
+
+SCRIPT="$0"
+HELP_PREFIX='# CMD:'
+HELP_CMD_PREFIX='# ARG-'
+
+
+
+# CMD: help [COMMAND] - lists availible commands
+# ARG-help: [COMMAND] - list helps for a command
+function help {
+    if [ -z ${1+x} ]; then
+        echo "Avilible commands for $SCRIPT :"
+        cat ${SCRIPT} | grep "^${HELP_PREFIX}" | sed -e "s/^${HELP_PREFIX}//"
+    else
+        echo "Arguments for $1 :"
+        cat ${SCRIPT} | grep "^$HELP_CMD_PREFIX$1:" | sed -e "s/^$HELP_CMD_PREFIX$1://"
+    fi
+}
+
+# CMD: build NAME [OPTION] - builds artifacts
+# ARG-build: NAME - artifact name
+# ARG-build: [COMMAND] - build option
+
+
+# assert_file <FAIL_MSG> <FILENAME>
+function assert_file {
+    if [ ! -f ${2} ]; then
+         echo "$1" >&2
+         exit 1
+    fi
+}
+
+# assert_arg <FAIL_MSG> <ARG>
+function assert_arg {
+    if [ -z ${2+x} ]; then
+        echo "$1" >&2
+        exit 1
+    fi
+}
+
+case "$1" in
+    help)
+        help $2
+        ;;
+
+
+    *)
+        echo "Invalid command: $1"
+        echo $"Usage: $0 {push|pull|deploy|repositories|clusters|services}"
+        exit 1
+        ;;
+esac
