@@ -15,10 +15,11 @@ function git_commit {
     git show -s --format='%h'
 }
 
-# CMD: tag - current tag (if any)
+# CMD: tag - last annoted tag (if any). Do NOT show lightweight tags
 function git_tag {
+    COMMIT=$(git_commit)
     set +e
-    git describe --exact-match "${GIT_COMMIT}" 2>/dev/null | sed -n 's/^\([^^~]\{1,\}\)\(\^0\)\{0,1\}$/\1/p'
+    git describe --exact-match "${COMMIT}" 2>/dev/null | sed -n 's/^\([^^~]\{1,\}\)\(\^0\)\{0,1\}$/\1/p'
     set -e
 }
 
@@ -27,7 +28,7 @@ function git_status {
     git status -s
 }
 
-# CMD: version - proposed version/tag using git info
+# CMD: version - proposed version/tag on format [BRANCH-]TAG|COMMIT[-SNAPSHOT]
 function version {
     STATUS_=$(git_status)
     BRANCH_=$(git_branch)
