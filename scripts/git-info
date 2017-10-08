@@ -15,7 +15,7 @@ function git_commit {
     git show -s --format='%h'
 }
 
-# CMD: tag - last annoted tag (if any). Do NOT show lightweight tags
+# CMD: tag - last annoted tag (if any). Dose NOT show lightweight tags
 function git_tag {
     COMMIT=$(git_commit)
     set +e
@@ -55,7 +55,6 @@ function version {
     echo "$BRANCH_$TAG_$STATUS_"
 }
 
-
 # CMD: help [COMMAND] - lists availible commands
 # ARG-help: [COMMAND] - list helps for a command
 function help {
@@ -67,6 +66,7 @@ function help {
         cat ${SCRIPT} | grep "^$HELP_CMD_PREFIX$1:" | sed -e "s/^$HELP_CMD_PREFIX$1://"
     fi
 }
+
 
 case "$1" in
     help)
@@ -88,8 +88,7 @@ case "$1" in
         version
         ;;
     *)
-        echo "Invalid command: $1"
-        echo $"Usage: $0 {push|pull|deploy|repositories|clusters|services}"
+        help $2
         exit 1
         ;;
 esac
