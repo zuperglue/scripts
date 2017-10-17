@@ -1,0 +1,453 @@
+#!/bin/bash
+
+set -o pipefail  # trace ERR through pipes
+set -o errtrace  # trace ERR through 'time command' and other functions
+# set -o nounset   ## set -u : exit the script if you try to use an uninitialised variable
+set -e   ## set -e , -o errexit: exit the script if any statement returns a non-true return value
+
+SCRIPT="$0"
+HELP_PREFIX='# CMD:'
+HELP_CMD_PREFIX='# ARG-'
+
+function aws_setup {
+    if [ -z ${AWS_REGION+x} ]; then
+        AWS_REGION=$(aws configure get region)
+    fi
+    if [ -z ${AWS_ACCOUNT_ID+x} ]; then
+        AWS_ACCOUNT_ID=$(aws ec2 describe-security-groups --query 'SecurityGroups[0].OwnerId' --output text)
+    fi
+    if [ -z ${ECR_REGISTRY+x} ]; then
+        ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    fi
+    if [ -z ${AWS_LOGGED_IN+x} ]; then
+        $(aws ecr get-login --no-include-email)
+        AWS_LOGGED_IN=1
+    fi
+}
+
+function bootstrapSourceDestinationInput {
+    # $1 is source as NAME:TAG
+    assert_name_tag_arg "Source NAME:TAG must be specified" $1
+    SOURCE_APP=${1%:*}
+    SOURCE_TAG=${1#*:}
+    SOURCE="$1"
+
+    # $2 is dest as NAME[:TAG]
+    DEST="$2"
+    assert_arg "Destination ECR_REPRO_NAME[:TAG] must be specified" $2
+    if [[ $2 == *":"* ]]; then
+        DEST_REPRO=${2%:*}
+        DEST_TAG=${2#*:}
+    else
+        DEST_REPRO="$2"
+        DEST_TAG="${SOURCE_APP}_${SOURCE_TAG}"
+    fi
+}
+
+function serviceSourceDestinationInput {
+    # $1 is source as NAME:TAG
+    assert_name_tag_arg "Source NAME:TAG must be specified" $1
+    SOURCE_APP=${1%:*}
+    SOURCE_TAG=${1#*:}
+    SOURCE="$1"
+
+    # $2 is dest as NAME[:TAG]
+    DEST="$2"
+    assert_arg "Destination ECR_REPRO_NAME[:TAG] must be specified" $2
+    if [[ $2 == *":"* ]]; then
+        DEST_REPRO=${2%:*}
+        DEST_TAG=${2#*:}
+    else
+        DEST_REPRO="${2}/${SOURCE_APP}"
+        DEST_TAG="${SOURCE_TAG}"
+    fi
+}
+
+function push {
+    echo "PUSH"
+    serviceSourceDestinationInput $1 $2
+    do_push
+    echo "PUSH ready: local ${SOURCE} ->  ${ECR_REGISTRY}/${DEST_REPRO}:${DEST_TAG}"
+
+}
+
+function do_push {
+    # depends on push
+
+    # Check if we can identify remote ECR repository
+    aws_setup
+
+    # Tag for remote ECR repository
+    docker tag "${SOURCE}" "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_TAG}"
+
+    # push to remote ECR repository
+    docker push "${ECR_REGISTRY}/${DEST_REPRO}"
+
+    #Remove tags for image to avoid re-push
+    docker rmi "${ECR_REGISTRY}/${DEST_REPRO}:${DEST_TAG}" >/dev/null
+
+}
+
+function pull {
+
+    # $1 is source as NAME:TAG
+    assert_name_tag_arg "Source ECR_REPRO_NAME:TAG must be specified" $1
+    SOURCE="$1"
+
+    # Check if we can identify remote ECR repository
+    aws_setup
+
+    # Pull from repro
+    docker pull "${ECR_REGISTRY}/${SOURCE}"
+
+}
+
+# CMD: deploy - deploy a new image to an ecs services
+# ARG-deploy: IMAGE - image name to deploy as SERVICE_NAME:TAG existing in locale docker registry
+# ARG-deploy: ENVIRONMENT - name of environemnt/cluster
+function deploy {
+    echo "DEPLOY"
+
+    # Check if we can identify remote ECR repository
+    aws_setup
+
+    # SOURCE($1), DEST_ENV_NAME($2) -> $SOURCE_APP, $SOURCE_TAG, $DEST_REPRO, $DEST_TAG
+    serviceSourceDestinationInput $1 $2
+    do_push
+
+    # use global vars created in sourceDestinationInput
+    ECS_CLUSTER_NAME="${DEST}"
+    ECS_SERVICE_NAME="${SOURCE_APP}"
+    echo "SOURCE_APP: ${SOURCE_APP} DEST_REPRO ${DEST}"
+    ECS_TASK_DEFINITION_NAME="${ECS_CLUSTER_NAME}-${ECS_SERVICE_NAME}"
+
+    # image name we want to update with...
+    IMAGE="${ECR_REGISTRY}/${DEST_REPRO}:${DEST_TAG}"
+
+
+
+    # Get current task definition
+    CUR_TASK_DEF=$(aws ecs describe-task-definition --task-definition "${ECS_TASK_DEFINITION_NAME}" )
+
+    # create updated container def with new image
+    CONTAINER_DEF=$( \
+        echo "${CUR_TASK_DEF}" | \
+        jq '.taskDefinition.containerDefinitions[0]' | \
+        jq -r ".image= \"${IMAGE}\" " \
+    )
+
+    # get current role
+    TASK_ROLE_ARN=$(echo "${CUR_TASK_DEF}" | jq -r '.taskDefinition.taskRoleArn')
+
+    # Create new task revision using updated container def
+    echo "- Updating task definition '$ECS_TASK_DEFINITION_NAME' with image '$IMAGE'"
+    aws ecs register-task-definition \
+        --family "${ECS_TASK_DEFINITION_NAME}" \
+        --container-definitions "${CONTAINER_DEF}" \
+        --task-role-arn "${TASK_ROLE_ARN}" \
+        >/dev/null
+#
+
+
+    # Update service with new task def
+    # If not auto deployed, check 'Minimum healthy percent' config for service...
+    echo "- Updating service '${ECS_SERVICE_NAME}' in cluster '${ECS_CLUSTER_NAME}' with new task definition"
+    aws ecs update-service \
+        --cluster "${ECS_CLUSTER_NAME}" \
+        --service "${ECS_SERVICE_NAME}"  \
+        --task-definition "${ECS_TASK_DEFINITION_NAME}" \
+        >/dev/null
+
+}
+
+# CMD: container - shows full conatainer definition for an installed services
+# ARG-container: CONTAINER - name of container
+# ARG-container: CLUSTER - name of environemnt/cluster
+function container {
+    # $1 is container name, $2 is cluster name
+    assert_arg "Container name must be specified" $1
+    assert_arg "Cluster name must be specified" $2
+    ECS_TASK_DEFINITION_NAME="$2-$1"
+
+    CONTAINER_DEF=$( \
+        aws ecs describe-task-definition --task-definition "${ECS_TASK_DEFINITION_NAME}" | \
+        jq '.taskDefinition.containerDefinitions[0]' \
+    )
+    echo "$CONTAINER_DEF" >&2
+}
+
+# CMD: image - shows image for a installed services
+# ARG-image: CONTAINER - name of container
+# ARG-image: CLUSTER - name of environemnt/cluster
+function image {
+    # $1 is container name, $2 is cluster name
+    assert_arg "Container name must be specified" $1
+    assert_arg "Cluster name must be specified" $2
+    ECS_TASK_DEFINITION_NAME="$2-$1"
+
+    IMAGE=$( \
+        aws ecs describe-task-definition --task-definition "${ECS_TASK_DEFINITION_NAME}" | \
+        jq '.taskDefinition.containerDefinitions[0].image' \
+    )
+    echo "$IMAGE" >&2
+}
+
+
+# CMD: install - installs a service in a ecs cluster using a cloadformation template
+# ARG-install: CONTAINER - name of container
+# ARG-install: TAG - TAG of container
+# ARG-install: ENVIRONMENT - name of environemnt/cluster
+# ARG-install: BUCKET - s3 bucket name where templete is copied
+# ARG-install: TEMPLATE - local cloadformation template for service
+function ecs_install {
+    echo "INSTALL"
+
+    # $1 is container name, $2 is environment name
+    assert_arg "Container name must be specified" $1
+    assert_arg "Container tag must be specified" $2
+    assert_arg "Environment name must be specified" $3
+    assert_arg "s3 bucket must be specified" $4
+    assert_file "cloudformation script 'ecs-service-$1-install.yaml' must exist" "ecs-service-$1-install.yaml"
+
+    # Check if we can identify remote ECR repository
+    aws_setup
+    echo "${ECR_REGISTRY}/$1:$2"
+
+    # Build  -> $CONTAINER_NAME $TAG
+    #docker_build $1 $2
+
+    # Push
+    bootstrapSourceDestinationInput "$1:$2" $3
+    do_push
+
+    # Upload file
+    aws s3 cp ./ s3://"$4"/ --recursive --exclude "*" --include "ecs-service*install.yaml"
+
+    TEMPLATE="https://s3.amazonaws.com/$4/ecs-service-$1-install.yaml"
+    #TEMPLATE="$3/ecs-service-$1-install.yaml"
+
+    STACK_NAME="$3-service-$1"
+    IMAGE="${ECR_REGISTRY}/$1:$2"
+    ENVIRONMENT_NAME="$3"
+
+    echo "ENVIRONMENT_NAME: ${ENVIRONMENT_NAME}"
+    echo "s3 file: ${TEMPLATE}"
+    echo "stack name: ${STACK_NAME}"
+    echo "image: ${IMAGE}"
+
+    aws cloudformation \
+        create-stack \
+        --template-url "$TEMPLATE" \
+        --parameters ParameterKey=Image,ParameterValue="${IMAGE}" ParameterKey=EnvironmentName,ParameterValue="${ENVIRONMENT_NAME}" \
+        --stack-name "$STACK_NAME" \
+        --capabilities CAPABILITY_NAMED_IAM
+
+}
+
+
+# CMD: repositories - list docker respositories
+function repositories {
+    echo "REPOSITORIES"
+    aws ecr describe-repositories | jq -r "[.repositories[].repositoryName]"
+}
+
+# CMD: stacks - list cloudformation stacks for cluster
+# ARG-stacks: CLUSTER - name of cluster
+function stacks {
+    echo "STACKS"
+    assert_arg "Cluster must be specified" $1
+
+    aws cloudformation list-stacks \
+        --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE | \
+        jq '[.StackSummaries[].StackName]' | \
+        grep "$1"* | \
+        sed 's/ //g' | \
+        sed 's/\,$//' | \
+        sed 's/^.\(.*\).$/\1/'
+}
+
+# CMD: cluster - list ecs cluster
+function clusters {
+    echo "CLUSTERS"
+    aws ecs list-clusters | \
+        jq '.clusterArns' | \
+        grep "arn*" | \
+        sed 's/ //g' | \
+        sed 's/\,$//' | \
+        sed 's/^.\(.*\).$/\1/' | \
+        sed 's/.*\///g'
+}
+
+# CMD: scale-cluster - scale desired instances for a cluster
+# ARG-scale-cluster: CLUSTER - name of cluster
+# ARG-scale-cluster: DESIRED - desired number of instances
+function ecs_scale_cluster {
+    assert_arg "Cluster name must be specified" $1
+    assert_arg "desired size must be specified" $2
+    SCALE_GROUP=$(aws autoscaling describe-auto-scaling-groups | \
+        jq '[.AutoScalingGroups[].AutoScalingGroupName]' | \
+        grep "$1"* | \
+        sed 's/ //g' | \
+        sed 's/\,$//' | \
+        sed 's/^.\(.*\).$/\1/' \
+        )
+    echo "$SCALE_GROUP"
+
+    aws autoscaling set-desired-capacity \
+        --auto-scaling-group-name "$SCALE_GROUP" \
+        --desired-capacity "$2"
+}
+
+
+# CMD: scale-service - scale desired containers for a service
+# ARG-scale-service: SERVICE - name of service
+# ARG-scale-service: CLUSTER - name of cluster
+# ARG-scale-service: DESIRED - desired number of containers
+function ecs_scale_service {
+    assert_arg "Service name must be specified" $1
+    assert_arg "Cluster name must be specified" $2
+    assert_arg "desired size must be specified" $3
+
+    aws ecs update-service --cluster "$2" --service "$1" --desired-count "$3" >/dev/null
+}
+
+function ecs_service_memory {
+    assert_arg "Service name must be specified" $1
+    assert_arg "Cluster name must be specified" $2
+    assert_arg "memory size must be specified" $3
+    SERVICE_NAME="$1"
+    CLUSTER_NAME="$2"
+    MEM="$3"
+
+    # Get current task definition
+    CUR_TASK_DEF=$(aws ecs describe-task-definition --task-definition "${CLUSTER_NAME}-${SERVICE_NAME}" )
+
+    # create updated container def with new image
+    CONTAINER_DEF=$( \
+        echo "${CUR_TASK_DEF}" | \
+        jq '.taskDefinition.containerDefinitions[0]' | \
+        jq -r ".memory= ${MEM} " \
+    )
+
+    # get current role
+    TASK_ROLE_ARN=$(echo "${CUR_TASK_DEF}" | jq -r '.taskDefinition.taskRoleArn')
+
+    # Create new task revision using updated container def
+    echo "- Updating task definition '$ECS_TASK_DEFINITION_NAME' with memory size '${MEM}'"
+    aws ecs register-task-definition \
+        --family "${CLUSTER_NAME}-${SERVICE_NAME}" \
+        --container-definitions "${CONTAINER_DEF}" \
+        --task-role-arn "${TASK_ROLE_ARN}" \
+        >/dev/null
+
+    # Update service with new task def
+    # If not auto deployed, check 'Minimum healthy percent' config for service...
+    echo "- Updating service '${SERVICE_NAME}' in cluster '${CLUSTER_NAME}' with new task definition"
+    aws ecs update-service \
+        --cluster "${CLUSTER_NAME}" \
+        --service "${SERVICE_NAME}"  \
+        --task-definition "${CLUSTER_NAME}-${SERVICE_NAME}" \
+        >/dev/null
+
+
+}
+
+# CMD: services - lists services in a ecs cluster
+# ARG-services: CLUSTER - name of cluster
+function services {
+    # Cluster must be specified
+    assert_arg "Cluster name must be specified" $1
+
+    echo "SERVICES ($1)"
+    aws ecs list-services --cluster "$1" | \
+        jq -r ".serviceArns" | \
+        grep arn:* | \
+        sed 's/ //g' | \
+        sed 's/\,$//' | \
+        sed 's/^.\(.*\).$/\1/' | \
+        sed 's/.*\///g'
+}
+
+function assert_file {
+    if [ ! -f ${2} ]; then
+         echo "$1" >&2
+         exit 1
+    fi
+}
+
+function assert_arg {
+    if [ -z ${2+x} ]; then
+        echo "$1" >&2
+        exit 1
+    fi
+}
+
+function assert_name_tag_arg {
+    assert_arg $1 $2
+    if [[ $2 != *":"* ]]; then
+        echo "$1" >&2
+        exit 1
+    fi
+}
+
+# CMD: help - lists availible commands
+# ARG-help: [COMMAND] - list arguments for a specific command
+function help {
+    if [ -z ${1+x} ]; then
+        echo "Avilible commands for $SCRIPT :"
+        cat ${SCRIPT} | grep "^${HELP_PREFIX}" | sed -e "s/^${HELP_PREFIX}//"
+    else
+        echo "Arguments for $1 :"
+        cat ${SCRIPT} | grep "^$HELP_CMD_PREFIX$1:" | sed -e "s/^$HELP_CMD_PREFIX$1://"
+    fi
+}
+
+case "$1" in
+    push)
+        push $2 $3
+        ;;
+    pull)
+        pull $2
+        ;;
+    deploy)
+        deploy $2 $3
+        ;;
+    container)
+        container $2 $3
+        ;;
+    image)
+        image $2 $3
+        ;;
+    repositories)
+        repositories
+        ;;
+    stacks)
+        stacks $2
+        ;;
+    clusters)
+        clusters
+        ;;
+    install)
+        ecs_install $2 $3 $4 $5
+        ;;
+    scale-cluster)
+        ecs_scale_cluster $2 $3
+        ;;
+    scale-service)
+         ecs_scale_service $2 $3 $4
+         ;;
+    service-memory)
+         ecs_service_memory $2 $3 $4
+         ;;
+    services)
+        services $2
+        ;;
+    help)
+        help $2
+        ;;
+    *)
+        echo "Invalid command: $1"
+        help $2
+        exit 1
+        ;;
+esac
