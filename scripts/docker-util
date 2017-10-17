@@ -1,0 +1,101 @@
+#!/bin/bash
+
+SCRIPT="$0"
+HELP_PREFIX='# CMD:'
+HELP_CMD_PREFIX='# ARG-'
+
+# CMD: clean-dangling - removes dangling images
+function clean_dangling {
+    # Remove all dangling images (without name,tags)
+    DANGLING=$(docker images -f dangling=true -q)
+    if [[ ! -z $DANGLING ]]; then
+        echo "- Removing dangling images"
+        docker rmi -f $DANGLING >/dev/null
+    fi
+}
+
+# CMD: clean - removes images having repository NAME
+# ARG-clean: NAME - name (repository) of container to remove
+function clean {
+    assert_arg "Container name must be specified" $1
+
+    if [ -e pom.xml ]; then
+        echo "- mvn clean"
+        mvn clean -q
+    fi
+
+    NAMED_IMAGES=$(docker images | grep $1 | tr -s ' ' | cut -d ' ' -f 3)
+    if [[ ! -z $NAMED_IMAGES ]]; then
+        echo "- Removing named images"
+        docker rmi -f $NAMED_IMAGES >/dev/null
+    fi
+}
+
+# CMD: build - build docker image having NAME and TAG
+# ARG-build: NAME - name of container to build
+# ARG-build: TAG - tag of container to build
+
+function docker_build {
+
+    assert_arg "Container name must be specified" $1
+    assert_arg "Tag name must be specified" $2
+
+    if [ -e pom.xml ]; then
+        echo "- mvn install"
+        mvn install -q -Dsurefire.printSummary=false -Dmaven.test.skip=true
+    fi
+
+    CONTAINER_NAME=$1
+    TAG=$2
+
+    echo "- docker build ->'${CONTAINER_NAME}:${TAG}'"
+    # Build local image
+    docker build  -t "${CONTAINER_NAME}:${TAG}" . >/dev/null
+
+    # Remove all dangling images (without name,tags)
+    clean_dangling
+
+    # lets list all images with container name to remind user to clean-up...
+    echo "IMAGE CLEANUP REMINDER..."
+    docker images "${CONTAINER_NAME}*"
+
+}
+
+# CMD: help - lists availible commands
+# ARG-help: [COMMAND] - list helps for a command
+function help {
+    if [ -z ${1+x} ]; then
+        echo "Avilible commands for $SCRIPT :"
+        cat ${SCRIPT} | grep "^${HELP_PREFIX}" | sed -e "s/^${HELP_PREFIX}//"
+    else
+        echo "Arguments for $1 :"
+        cat ${SCRIPT} | grep "^$HELP_CMD_PREFIX$1:" | sed -e "s/^$HELP_CMD_PREFIX$1://"
+    fi
+}
+
+function assert_arg {
+    if [ -z ${2+x} ]; then
+        echo "$1" >&2
+        exit 1
+    fi
+}
+
+
+case "$1" in
+    help)
+        help $2
+        ;;
+    build)
+        docker_build $2 $3
+        ;;
+    clean-dangling)
+        clean_dangling
+        ;;
+    clean)
+        clean $2
+        ;;
+    *)
+        help $2
+        exit 1
+        ;;
+esac
